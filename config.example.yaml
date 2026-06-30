@@ -4,6 +4,7 @@ server:
   max_body_bytes: 16777216
   shutdown_grace_seconds: 30
   require_anthropic_version: true
+  loose_input_validation: false
 
 limits:
   global_concurrency: 512
@@ -40,6 +41,12 @@ providers:
       supports_stop: true
       max_output_tokens: 16384
       use_max_completion_tokens: false
+      allow_max_tokens_clamping: false
+      allow_temperature_fallback: false
+      allow_top_p_fallback: false
+      allow_stop_fallback: false
+      allow_parallel_tool_fallback: false
+      allow_structured_tool_results_to_string: false
     headers:
       user-agent: claude-code-proxy/0.2.0
 

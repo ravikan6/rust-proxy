@@ -30,6 +30,7 @@ pub struct ServerConfig {
     pub max_body_bytes: usize,
     pub shutdown_grace_seconds: u64,
     pub require_anthropic_version: bool,
+    pub loose_input_validation: bool,
 }
 
 impl Default for ServerConfig {
@@ -40,6 +41,7 @@ impl Default for ServerConfig {
             max_body_bytes: 16 * 1024 * 1024,
             shutdown_grace_seconds: 30,
             require_anthropic_version: true,
+            loose_input_validation: false,
         }
     }
 }
@@ -182,6 +184,12 @@ pub struct CapabilityProfile {
     pub supports_stop: bool,
     pub max_output_tokens: u32,
     pub use_max_completion_tokens: bool,
+    pub allow_max_tokens_clamping: bool,
+    pub allow_temperature_fallback: bool,
+    pub allow_top_p_fallback: bool,
+    pub allow_stop_fallback: bool,
+    pub allow_parallel_tool_fallback: bool,
+    pub allow_structured_tool_results_to_string: bool,
 }
 
 impl Default for CapabilityProfile {
@@ -196,6 +204,12 @@ impl Default for CapabilityProfile {
             supports_stop: true,
             max_output_tokens: 16_384,
             use_max_completion_tokens: false,
+            allow_max_tokens_clamping: false,
+            allow_temperature_fallback: false,
+            allow_top_p_fallback: false,
+            allow_stop_fallback: false,
+            allow_parallel_tool_fallback: false,
+            allow_structured_tool_results_to_string: false,
         }
     }
 }

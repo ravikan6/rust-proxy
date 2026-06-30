@@ -101,7 +101,7 @@ async fn messages_inner(
     let Json(request) = payload.map_err(|error| {
         ProxyError::invalid(format!("invalid JSON request: {}", error.body_text()))
     })?;
-    let request = normalize(request)?;
+    let request = normalize(request, runtime.config.server.loose_input_validation)?;
     let routed = runtime.router.resolve(&request)?;
     if !identity.allows_route(&routed.route.id) {
         return Err(ProxyError::new(
@@ -201,7 +201,7 @@ async fn count_tokens(
         let request: AnthropicRequest = serde_json::from_value(value).map_err(|error| {
             ProxyError::invalid(format!("invalid token count request: {error}"))
         })?;
-        let request = normalize(request)?;
+        let request = normalize(request, runtime.config.server.loose_input_validation)?;
         let routed = runtime.router.resolve(&request)?;
         if !identity.allows_route(&routed.route.id) {
             return Err(ProxyError::new(

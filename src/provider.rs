@@ -112,29 +112,72 @@ impl Provider {
         }
     }
 
-    pub fn validate_request(&self, request: &NormalizedRequest) -> Result<()> {
-        if request.max_tokens > self.capabilities.max_output_tokens {
-            return Err(ProxyError::invalid(format!(
-                "max_tokens exceeds target limit {}",
-                self.capabilities.max_output_tokens
-            )));
+    pub fn adapt_request(&self, request: &NormalizedRequest) -> Result<NormalizedRequest> {
+        let mut adapted = request.clone();
+
+        if adapted.max_tokens > self.capabilities.max_output_tokens {
+            if self.capabilities.allow_max_tokens_clamping {
+                metrics::counter!(
+                    "proxy_request_adapted_total",
+                    "provider" => self.id.clone(),
+                    "hint" => "max_tokens_clamped"
+                )
+                .increment(1);
+                adapted.max_tokens = self.capabilities.max_output_tokens;
+            } else {
+                return Err(ProxyError::invalid(format!(
+                    "max_tokens exceeds target limit {}",
+                    self.capabilities.max_output_tokens
+                )));
+            }
         }
-        if request.temperature.is_some() && !self.capabilities.supports_temperature {
-            return Err(ProxyError::invalid("target does not support temperature"));
+
+        if adapted.temperature.is_some() && !self.capabilities.supports_temperature {
+            if self.capabilities.allow_temperature_fallback {
+                metrics::counter!(
+                    "proxy_request_adapted_total",
+                    "provider" => self.id.clone(),
+                    "hint" => "temperature_dropped"
+                )
+                .increment(1);
+                adapted.temperature = None;
+            } else {
+                return Err(ProxyError::invalid("target does not support temperature"));
+            }
         }
-        if request.top_p.is_some() && !self.capabilities.supports_top_p {
-            return Err(ProxyError::invalid("target does not support top_p"));
+        if adapted.top_p.is_some() && !self.capabilities.supports_top_p {
+            if self.capabilities.allow_top_p_fallback {
+                metrics::counter!(
+                    "proxy_request_adapted_total",
+                    "provider" => self.id.clone(),
+                    "hint" => "top_p_dropped"
+                )
+                .increment(1);
+                adapted.top_p = None;
+            } else {
+                return Err(ProxyError::invalid("target does not support top_p"));
+            }
         }
-        if !request.stop_sequences.is_empty() && !self.capabilities.supports_stop {
-            return Err(ProxyError::invalid(
-                "target does not support stop sequences",
-            ));
+        if !adapted.stop_sequences.is_empty() && !self.capabilities.supports_stop {
+            if self.capabilities.allow_stop_fallback {
+                metrics::counter!(
+                    "proxy_request_adapted_total",
+                    "provider" => self.id.clone(),
+                    "hint" => "stop_sequences_cleared"
+                )
+                .increment(1);
+                adapted.stop_sequences.clear();
+            } else {
+                return Err(ProxyError::invalid(
+                    "target does not support stop sequences",
+                ));
+            }
         }
-        if !request.tools.is_empty() && !self.capabilities.tools {
+        if !adapted.tools.is_empty() && !self.capabilities.tools {
             return Err(ProxyError::invalid("target does not support tools"));
         }
         if matches!(
-            request.tool_choice,
+            adapted.tool_choice,
             Some(
                 ToolChoice::Auto {
                     disable_parallel: false
@@ -147,29 +190,72 @@ impl Provider {
             )
         ) && !self.capabilities.parallel_tools
         {
-            return Err(ProxyError::invalid(
-                "target does not support parallel tools",
-            ));
+            if self.capabilities.allow_parallel_tool_fallback {
+                metrics::counter!(
+                    "proxy_request_adapted_total",
+                    "provider" => self.id.clone(),
+                    "hint" => "parallel_tools_disabled"
+                )
+                .increment(1);
+                adapted.tool_choice = adapted.tool_choice.take().map(|choice| match choice {
+                    ToolChoice::Auto { .. } => ToolChoice::Auto {
+                        disable_parallel: true,
+                    },
+                    ToolChoice::Any { .. } => ToolChoice::Any {
+                        disable_parallel: true,
+                    },
+                    ToolChoice::Tool { name, .. } => ToolChoice::Tool {
+                        name,
+                        disable_parallel: true,
+                    },
+                    ToolChoice::None => ToolChoice::None,
+                });
+            } else {
+                return Err(ProxyError::invalid(
+                    "target does not support parallel tools",
+                ));
+            }
         }
-        for message in &request.messages {
-            for block in &message.blocks {
+        for message in &mut adapted.messages {
+            for block in &mut message.blocks {
                 match block {
                     InputBlock::Image { .. } if !self.capabilities.vision => {
                         return Err(ProxyError::invalid("target does not support image input"))
                     }
                     InputBlock::ToolResult { content, .. } if !content.is_string() => {
-                        return Err(ProxyError::invalid("structured or multimodal tool results are not supported by Chat Completions targets"));
+                        if self.capabilities.allow_structured_tool_results_to_string {
+                            let serialized = serde_json::to_string(content).map_err(|_| {
+                                ProxyError::invalid(
+                                    "could not serialize structured tool result to string",
+                                )
+                            })?;
+                            *content = serde_json::Value::String(serialized);
+                            metrics::counter!(
+                                "proxy_request_adapted_total",
+                                "provider" => self.id.clone(),
+                                "hint" => "tool_result_json_stringified"
+                            )
+                            .increment(1);
+                        } else {
+                            return Err(ProxyError::invalid(
+                                "structured or multimodal tool results are not supported by Chat Completions targets",
+                            ));
+                        }
                     }
                     _ => {}
                 }
             }
         }
-        Ok(())
+        Ok(adapted)
+    }
+
+    pub fn validate_request(&self, request: &NormalizedRequest) -> Result<()> {
+        self.adapt_request(request).map(|_| ())
     }
 
     pub fn count_tokens(&self, request: &NormalizedRequest) -> Result<u64> {
-        self.validate_request(request)?;
-        count_tokens(request, &self.capabilities.tokenizer)
+        let adapted = self.adapt_request(request)?;
+        count_tokens(&adapted, &self.capabilities.tokenizer)
     }
 
     pub async fn execute(
@@ -177,8 +263,8 @@ impl Provider {
         request: &NormalizedRequest,
         model: &str,
     ) -> Result<AnthropicResponse> {
-        self.validate_request(request)?;
-        let body = self.build_request(request, model, false)?;
+        let adapted = self.adapt_request(request)?;
+        let body = self.build_request(&adapted, model, false)?;
         let response = self.send(body).await?;
         let parsed: OpenAiResponse = response.json().await.map_err(|error| {
             ProxyError::new(
@@ -190,8 +276,8 @@ impl Provider {
     }
 
     pub async fn stream(&self, request: &NormalizedRequest, model: &str) -> Result<EventStream> {
-        self.validate_request(request)?;
-        let body = self.build_request(request, model, true)?;
+        let adapted = self.adapt_request(request)?;
+        let body = self.build_request(&adapted, model, true)?;
         let response = self.send(body).await?;
         let byte_stream = response.bytes_stream();
         Ok(Box::pin(parse_sse(byte_stream)))
@@ -653,7 +739,7 @@ mod tests {
                 {"role":"user","content":[{"type":"tool_result","tool_use_id":"call_1","content":"/tmp"}]}
             ], "tools":[{"name":"shell","input_schema":{"type":"object"}}]
         })).unwrap();
-        let messages = convert_messages(&normalize(request).unwrap()).unwrap();
+        let messages = convert_messages(&normalize(request, false).unwrap()).unwrap();
         assert_eq!(messages[0]["tool_calls"][0]["id"], "call_1");
         assert_eq!(messages[1]["role"], "tool");
     }

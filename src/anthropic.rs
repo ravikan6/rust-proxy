@@ -9,7 +9,8 @@ use crate::{
     error::{ProxyError, Result},
 };
 
-pub fn normalize(request: AnthropicRequest) -> Result<NormalizedRequest> {
+pub fn normalize(request: AnthropicRequest, loose_validation: bool) -> Result<NormalizedRequest> {
+    let strict = !loose_validation;
     if request.model.trim().is_empty() {
         return Err(ProxyError::invalid("model must not be empty"));
     }
@@ -36,7 +37,7 @@ pub fn normalize(request: AnthropicRequest) -> Result<NormalizedRequest> {
             "max_tokens must be greater than zero for Chat Completions targets",
         ));
     }
-    if !request.extensions.keys().all(|key| key == "cache_control") {
+    if strict && !request.extensions.keys().all(|key| key == "cache_control") {
         return Err(ProxyError::invalid(format!(
             "unsupported request fields: {}",
             request
@@ -52,11 +53,11 @@ pub fn normalize(request: AnthropicRequest) -> Result<NormalizedRequest> {
         metrics::counter!("proxy_translation_hints_discarded_total", "hint" => "cache_control")
             .increment(1);
     }
-    if request.thinking.is_some() {
-        return Err(ProxyError::invalid(
-            "extended thinking cannot be represented by Chat Completions targets",
-        ));
-    }
+    // if request.thinking.is_some() {
+    //     return Err(ProxyError::invalid(
+    //         "extended thinking cannot be represented by Chat Completions targets",
+    //     ));
+    // }
     if request.top_k.is_some() {
         return Err(ProxyError::invalid(
             "top_k is not supported by configured Chat Completions targets",
@@ -71,7 +72,7 @@ pub fn normalize(request: AnthropicRequest) -> Result<NormalizedRequest> {
 
     let mut messages = Vec::new();
     if let Some(system) = request.system.as_ref() {
-        let blocks = parse_system(system)?;
+        let blocks = parse_system(system, strict)?;
         if !blocks.is_empty() {
             messages.push(NormalizedMessage {
                 role: MessageRole::System,
@@ -84,13 +85,14 @@ pub fn normalize(request: AnthropicRequest) -> Result<NormalizedRequest> {
         let role = match message.role.as_str() {
             "user" => MessageRole::User,
             "assistant" => MessageRole::Assistant,
+            "system" => MessageRole::System,
             _ => {
                 return Err(ProxyError::invalid(format!(
-                    "messages[{index}].role must be user or assistant"
+                    "messages[{index}].role must be user, assistant, or system"
                 )))
             }
         };
-        let blocks = parse_content(&message.content, index)?;
+        let blocks = parse_content(&message.content, index, strict)?;
         messages.push(NormalizedMessage { role, blocks });
     }
     validate_tool_history(&messages)?;
@@ -108,7 +110,7 @@ pub fn normalize(request: AnthropicRequest) -> Result<NormalizedRequest> {
                 "tool names must be unique and contain 1-64 letters, digits, underscores, or hyphens",
             ));
         }
-        if !tool.extensions.keys().all(|key| key == "cache_control") {
+        if strict && !tool.extensions.keys().all(|key| key == "cache_control") {
             return Err(ProxyError::invalid(format!(
                 "tool {} contains unsupported fields",
                 tool.name
@@ -122,7 +124,7 @@ pub fn normalize(request: AnthropicRequest) -> Result<NormalizedRequest> {
         }
     }
 
-    let tool_choice = parse_tool_choice(request.tool_choice.as_ref())?;
+    let tool_choice = parse_tool_choice(request.tool_choice.as_ref(), strict)?;
     if let Some(ToolChoice::Tool { name, .. }) = &tool_choice {
         if !names.contains(name) {
             return Err(ProxyError::invalid(format!(
@@ -154,7 +156,7 @@ pub fn normalize(request: AnthropicRequest) -> Result<NormalizedRequest> {
     })
 }
 
-fn parse_system(value: &Value) -> Result<Vec<InputBlock>> {
+fn parse_system(value: &Value, strict: bool) -> Result<Vec<InputBlock>> {
     match value {
         Value::String(text) => Ok(vec![InputBlock::Text(text.clone())]),
         Value::Array(blocks) => blocks
@@ -171,6 +173,7 @@ fn parse_system(value: &Value) -> Result<Vec<InputBlock>> {
                     block,
                     &["type", "text", "cache_control"],
                     &format!("system[{index}]"),
+                    strict,
                 )?;
                 Ok(InputBlock::Text(text.to_owned()))
             })
@@ -181,7 +184,7 @@ fn parse_system(value: &Value) -> Result<Vec<InputBlock>> {
     }
 }
 
-fn parse_content(value: &Value, message_index: usize) -> Result<Vec<InputBlock>> {
+fn parse_content(value: &Value, message_index: usize, strict: bool) -> Result<Vec<InputBlock>> {
     if let Some(text) = value.as_str() {
         return Ok(vec![InputBlock::Text(text.to_owned())]);
     }
@@ -205,6 +208,7 @@ fn parse_content(value: &Value, message_index: usize) -> Result<Vec<InputBlock>>
                     block,
                     &["type", "text", "cache_control", "citations"],
                     &path,
+                    strict,
                 )?;
                 if block.get("citations").is_some_and(|value| !value.is_null()) {
                     return Err(ProxyError::invalid(format!(
@@ -213,12 +217,13 @@ fn parse_content(value: &Value, message_index: usize) -> Result<Vec<InputBlock>>
                 }
                 InputBlock::Text(required_str(block, "text", &path)?.to_owned())
             }
-            "image" => parse_image(block, &path)?,
+            "image" => parse_image(block, &path, strict)?,
             "tool_use" => {
                 ensure_only(
                     block,
                     &["type", "id", "name", "input", "cache_control"],
                     &path,
+                    strict,
                 )?;
                 InputBlock::ToolUse {
                     id: required_str(block, "id", &path)?.to_owned(),
@@ -243,6 +248,7 @@ fn parse_content(value: &Value, message_index: usize) -> Result<Vec<InputBlock>>
                         "cache_control",
                     ],
                     &path,
+                    strict,
                 )?;
                 InputBlock::ToolResult {
                     tool_use_id: required_str(block, "tool_use_id", &path)?.to_owned(),
@@ -267,8 +273,8 @@ fn parse_content(value: &Value, message_index: usize) -> Result<Vec<InputBlock>>
     Ok(output)
 }
 
-fn parse_image(block: &Value, path: &str) -> Result<InputBlock> {
-    ensure_only(block, &["type", "source", "cache_control"], path)?;
+fn parse_image(block: &Value, path: &str, strict: bool) -> Result<InputBlock> {
+    ensure_only(block, &["type", "source", "cache_control"], path, strict)?;
     let source = block
         .get("source")
         .and_then(Value::as_object)
@@ -377,7 +383,7 @@ fn validate_tool_history(messages: &[NormalizedMessage]) -> Result<()> {
     Ok(())
 }
 
-fn parse_tool_choice(value: Option<&Value>) -> Result<Option<ToolChoice>> {
+fn parse_tool_choice(value: Option<&Value>, strict: bool) -> Result<Option<ToolChoice>> {
     let Some(value) = value else { return Ok(None) };
     let kind = required_str(value, "type", "tool_choice")?;
     let disable_parallel = value
@@ -386,15 +392,15 @@ fn parse_tool_choice(value: Option<&Value>) -> Result<Option<ToolChoice>> {
         .unwrap_or(false);
     let choice = match kind {
         "auto" => {
-            ensure_only(value, &["type", "disable_parallel_tool_use"], "tool_choice")?;
+            ensure_only(value, &["type", "disable_parallel_tool_use"], "tool_choice", strict)?;
             ToolChoice::Auto { disable_parallel }
         }
         "any" => {
-            ensure_only(value, &["type", "disable_parallel_tool_use"], "tool_choice")?;
+            ensure_only(value, &["type", "disable_parallel_tool_use"], "tool_choice", strict)?;
             ToolChoice::Any { disable_parallel }
         }
         "none" => {
-            ensure_only(value, &["type"], "tool_choice")?;
+            ensure_only(value, &["type"], "tool_choice", strict)?;
             ToolChoice::None
         }
         "tool" => {
@@ -402,6 +408,7 @@ fn parse_tool_choice(value: Option<&Value>) -> Result<Option<ToolChoice>> {
                 value,
                 &["type", "name", "disable_parallel_tool_use"],
                 "tool_choice",
+                strict,
             )?;
             ToolChoice::Tool {
                 name: required_str(value, "name", "tool_choice")?.to_owned(),
@@ -424,7 +431,10 @@ fn required_str<'a>(value: &'a Value, key: &str, path: &str) -> Result<&'a str> 
         .ok_or_else(|| ProxyError::invalid(format!("{path}.{key} must be a string")))
 }
 
-fn ensure_only(value: &Value, allowed: &[&str], path: &str) -> Result<()> {
+fn ensure_only(value: &Value, allowed: &[&str], path: &str, strict: bool) -> Result<()> {
+    if !strict {
+        return Ok(());
+    }
     let object = value
         .as_object()
         .ok_or_else(|| ProxyError::invalid(format!("{path} must be an object")))?;
@@ -647,7 +657,7 @@ mod tests {
                 {"type":"text","text":"look"}, {"type":"image","source":{"type":"base64","media_type":"image/png","data":"YWJj"}}
             ]}], "tools":[{"name":"lookup","input_schema":{"type":"object"}}]
         })).unwrap();
-        let normalized = normalize(request).unwrap();
+        let normalized = normalize(request, false).unwrap();
         assert_eq!(normalized.tools.len(), 1);
         assert_eq!(normalized.messages.len(), 1);
     }
@@ -657,9 +667,35 @@ mod tests {
         let request: AnthropicRequest = serde_json::from_value(json!({
             "model":"x", "max_tokens":1, "messages":[{"role":"user","content":"x"}], "thinking":{"type":"enabled","budget_tokens":10}
         })).unwrap();
-        assert!(normalize(request)
+        assert!(normalize(request, false)
             .unwrap_err()
             .to_string()
             .contains("thinking"));
+    }
+
+    #[test]
+    fn allows_extra_claude_fields_when_loose_validation_enabled() {
+        let request: AnthropicRequest = serde_json::from_value(json!({
+            "model":"claude-sonnet-4",
+            "max_tokens":100,
+            "messages":[{"role":"user","content":"hello"}],
+            "tools":[{"name":"lookup","input_schema":{"type":"object"}}],
+            "thinking":{"type":"enabled","budget_tokens":10},
+            "extra_field":"some-value"
+        })).unwrap();
+        let result = normalize(request, true);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("thinking"));
+    }
+
+    #[test]
+    fn accepts_unknown_tool_extensions_when_loose_validation_enabled() {
+        let request: AnthropicRequest = serde_json::from_value(json!({
+            "model":"claude-sonnet-4",
+            "max_tokens":100,
+            "messages":[{"role":"user","content":"hello"}],
+            "tools":[{"name":"lookup","input_schema":{"type":"object"}, "unknown_tool_meta":"x"}]
+        })).unwrap();
+        assert!(normalize(request, true).is_ok());
     }
 }

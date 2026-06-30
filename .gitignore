@@ -43,3 +43,6 @@ cargo-cult/
 # Secrets
 .env
 .env.*
+
+# Generated runtime config
+config.yaml

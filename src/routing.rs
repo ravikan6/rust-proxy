@@ -76,7 +76,7 @@ impl Router {
     pub async fn execute(&self, routed: RoutedRequest<'_>) -> Result<AnthropicResponse> {
         let candidates = self.candidates(routed.route, routed.request)?;
         let mut errors = Vec::new();
-        for (attempt, (provider, target)) in
+        for (attempt, (provider, target, request)) in
             candidates.into_iter().take(self.max_attempts).enumerate()
         {
             if attempt > 0 {
@@ -85,7 +85,7 @@ impl Router {
             }
             let outcome = tokio::time::timeout(
                 self.timeout,
-                provider.execute(routed.request, &target.model),
+                provider.execute(&request, &target.model),
             )
             .await;
             match outcome {
@@ -116,18 +116,18 @@ impl Router {
         let candidates = self.candidates(routed.route, routed.request)?;
         let input_tokens = candidates
             .first()
-            .map(|(provider, _)| provider.count_tokens(routed.request))
+            .map(|(provider, _, request)| provider.count_tokens(request))
             .transpose()?
             .unwrap_or(0);
         let mut errors = Vec::new();
-        for (attempt, (provider, target)) in
+        for (attempt, (provider, target, request)) in
             candidates.into_iter().take(self.max_attempts).enumerate()
         {
             if attempt > 0 {
                 metrics::counter!("proxy_fallback_total", "route" => routed.route.id.clone())
                     .increment(1);
             }
-            match tokio::time::timeout(self.timeout, provider.stream(routed.request, &target.model))
+            match tokio::time::timeout(self.timeout, provider.stream(&request, &target.model))
                 .await
             {
                 Ok(Ok(mut upstream)) => {
@@ -171,10 +171,10 @@ impl Router {
 
     pub fn count_tokens(&self, routed: RoutedRequest<'_>) -> Result<u64> {
         let candidates = self.candidates(routed.route, routed.request)?;
-        let (provider, _) = candidates.first().ok_or_else(|| {
+        let (provider, _, request) = candidates.first().ok_or_else(|| {
             ProxyError::new(ErrorKind::Overloaded, "no healthy target is available")
         })?;
-        provider.count_tokens(routed.request)
+        provider.count_tokens(request)
     }
 
     pub async fn probe(&self, provider_id: &str) -> Result<()> {
@@ -189,7 +189,7 @@ impl Router {
         &self,
         route: &Route,
         request: &NormalizedRequest,
-    ) -> Result<Vec<(Arc<Provider>, TargetConfig)>> {
+    ) -> Result<Vec<(Arc<Provider>, TargetConfig, NormalizedRequest)>> {
         let mut compatible = Vec::new();
         let mut capability_error = None;
         for target in &route.targets {
@@ -197,11 +197,11 @@ impl Router {
                 .providers
                 .get(&target.provider)
                 .expect("validated provider reference");
-            match provider.validate_request(request) {
-                Ok(()) if provider.available() => {
-                    compatible.push((provider.clone(), target.clone()))
+            match provider.adapt_request(request) {
+                Ok(adapted) if provider.available() => {
+                    compatible.push((provider.clone(), target.clone(), adapted))
                 }
-                Ok(()) => {}
+                Ok(_) => {}
                 Err(error) => {
                     capability_error.get_or_insert(error);
                 }
@@ -245,23 +245,23 @@ impl Route {
 }
 
 fn weighted_priority_order(
-    mut candidates: Vec<(Arc<Provider>, TargetConfig)>,
-) -> Vec<(Arc<Provider>, TargetConfig)> {
-    candidates.sort_by_key(|(_, target)| target.priority);
+    mut candidates: Vec<(Arc<Provider>, TargetConfig, NormalizedRequest)>,
+) -> Vec<(Arc<Provider>, TargetConfig, NormalizedRequest)> {
+    candidates.sort_by_key(|(_, target, _)| target.priority);
     let mut output = Vec::with_capacity(candidates.len());
     while !candidates.is_empty() {
         let priority = candidates[0].1.priority;
         let tier_len = candidates
             .iter()
-            .take_while(|(_, target)| target.priority == priority)
+            .take_while(|(_, target, _)| target.priority == priority)
             .count();
         let total: u64 = candidates[..tier_len]
             .iter()
-            .map(|(_, target)| target.weight as u64)
+            .map(|(_, target, _)| target.weight as u64)
             .sum();
         let mut choice = rand::rng().random_range(0..total);
         let mut selected = 0;
-        for (index, (_, target)) in candidates[..tier_len].iter().enumerate() {
+        for (index, (_, target, _)) in candidates[..tier_len].iter().enumerate() {
             if choice < target.weight as u64 {
                 selected = index;
                 break;
